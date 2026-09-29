@@ -1,0 +1,51 @@
+# logarch_triage_rules.tsv — rules read by logarch_triage.py. Edit freely, then re-run `logarch_local.sh triage <STAMP>`.
+# Columns are separated by TWO or more spaces (or TABs):  kind  pattern  value  evidence
+#   snapshot     token   → a path component containing "(token" or "_token" (case-insensitive) is a snapshot/backup copy
+#   abandoned    glob    → path under logs/ ('*' also crosses '/'); first match wins
+#   keep_render  glob    → GIF/MP4 renders under these paths stay in the curated layer (renders are dropped elsewhere)
+#   group        glob    → curated/<group>/…; first match wins, so specific rules go first
+# Snapshots and abandoned lines are EXCLUDED from curated/ by default (they stay in raw/), unless the thesis cites them.
+
+snapshot     bf_          before-fix snapshot         repo convention: tools/clean_gifs/sweep/README.md ("(Bf_…)" dirs are dead, not cited in DA_in_Paper/Writing, 2026-09-19)
+snapshot     archive      archived copy               repo convention: tools/clean_gifs/sweep/README.md
+snapshot     smoke        smoke run                   repo convention: tools/clean_gifs/sweep/README.md
+snapshot     legacy       legacy snapshot             repo convention: .claude/memory/archived-codes-is-dead-code.md
+snapshot     outdated     outdated snapshot           repo convention: .claude/memory/archived-codes-is-dead-code.md
+snapshot     abandoned    abandoned snapshot          repo convention: .claude/memory/archived-codes-is-dead-code.md
+snapshot     incorrect    marked incorrect            folder name says so
+snapshot     unfull       incomplete run              folder name says so
+snapshot     before_u     pre-update copy             folder name says so (e.g. *_before_u12)
+
+abandoned    avoiding-d3il-visual*                  visual-avoiding line abandoned     logs_in_develop/MASTER_TEST_HISTORY.md — "Visual-Avoiding Abandoned (Gen4, Gen9, Gen16)"
+abandoned    avoiding-d3il/*fm_visual_avoiding*     visual-avoiding line abandoned     logs_in_develop/MASTER_TEST_HISTORY.md — "Visual-Avoiding Abandoned (Gen4, Gen9, Gen16)"
+abandoned    avoiding-d3il/*flow_matching_v3_imeanflow*   iMF line given up            logs_in_develop/MASTER_TEST_HISTORY.md — Gen3v4 "FAILED / GIVEN UP (July 2026)"
+
+keep_render  *expert_references*    DA figure source             Data_Analysis/DA_in_Paper/plotting/sources.py (fig_aligning_camera_overhead / _wrist)
+keep_render  uav_expert_data*       expert demonstration renders tools/clean_gifs/sweep/README.md (author's call 2026-09-19: may become thesis figures)
+
+group        UAV_MIX*                                      Gen15_UAV_MixML               MASTER_TEST_HISTORY.md — Gen15 (UAV Mix-ML)
+group        UAV_FM*                                       Gen11_UAV_FM                  MASTER_TEST_HISTORY.md — Gen11 (UAV Vis-Traj in MuJoCo)
+group        Gen11E6_init_test*                            Gen11_UAV_FM                  MASTER_TEST_HISTORY.md — Gen11, epoch E6
+group        uav_expert_data*                              Gen11_UAV_expert_data         MASTER_TEST_HISTORY.md — Gen11 expert data collection
+group        uav_env*                                      Gen11_UAV_env                 MASTER_TEST_HISTORY.md — Gen11 epoch 1 (UAV model)
+group        uav_naive*                                    Gen11_UAV_env                 MASTER_TEST_HISTORY.md — Gen11 epoch 1 (UAV model)
+group        aligning-d3il-visual/*mix_visual_aligning*    Gen14_Visual_MixML            MASTER_TEST_HISTORY.md — Gen14 (Visual-Mix-ML)
+group        aligning-d3il-visual/*fm_visual_aligning*     Gen7_Visual_FM                MASTER_TEST_HISTORY.md — Gen7 (Visual Flow Matching)
+group        aligning-d3il-visual/*visual_aligning_dpcc*   Gen6v4_Visual_DPCC            MASTER_TEST_HISTORY.md — Gen6v4 (Visual DPCC 9D)
+group        aligning-d3il-visual*                         D3IL_aligning_misc            split-tree files outside the engine folders
+group        avoiding-d3il/*flow_matching_v3_hardflow*     Gen12_HardFlow_FMv3           MASTER_TEST_HISTORY.md — Gen12 (HardFlow → FMv3ODE)
+group        avoiding-d3il/*flow_matching_v3_alphaflow*    Gen3v7_AlphaFlow              MASTER_TEST_HISTORY.md — Gen3v7 (α-Flow)
+group        avoiding-d3il/*flow_matching_v3_meanflow*     Gen3v6_MeanFlow               MASTER_TEST_HISTORY.md — Gen3v6 (MeanFlow Baseline)
+group        avoiding-d3il/*flow_matching_v3_imeanflow*    Gen3v4_iMeanFlow              MASTER_TEST_HISTORY.md — Gen3v4 (iMeanFlow)
+group        avoiding-d3il/*flow_matching_v3_drifting*     Gen3v3_Drifting               MASTER_TEST_HISTORY.md — Gen3v3 (Drifting Engine)
+group        avoiding-d3il/*flow_matching_v3_ode_selectable*  Gen3v2_FMv3_ODE            MASTER_TEST_HISTORY.md — Gen3v2 (ODE Solver Addon)
+group        avoiding-d3il/*fm_visual_avoiding*            Gen9_Visual_Avoiding          MASTER_TEST_HISTORY.md — Gen9 (Visual Avoiding Env)
+group        avoiding-d3il/*diffusion*                     Gen0_DPCC_diffusion_baseline  MASTER_TEST_HISTORY.md — Gen0 (Baseline, DPCC GaussianDiffusion)
+group        avoiding-d3il-visual-mix*                     Gen16_Visual_Avoiding_MixML   MASTER_TEST_HISTORY.md — Gen16 (Visual-Avoiding Mix-ML)
+group        avoiding-d3il-visual*                         Gen9_Visual_Avoiding          MASTER_TEST_HISTORY.md — Gen9 (Visual Avoiding Env)
+group        avoiding-d3il*                                D3IL_avoiding_misc            split-tree files outside the engine folders
+group        d3il_visual_aligning_baseline*                Gen5_D3IL_visual_baseline     MASTER_TEST_HISTORY.md — Gen5 (Visual Aligning, D3IL baseline)
+group        hardflow*                                     Gen13_HardFlow                MASTER_TEST_HISTORY.md — Gen13 (HardFlow, vendored)
+group        solver_bench*                                 misc_solver_bench             no generation row (ODE solver timing)
+group        _clean_weights_runlogs*                       misc_tool_logs                tools/clean_weights/README.md (audit logs)
+group        *                                             unmapped                      no rule matched — add one above

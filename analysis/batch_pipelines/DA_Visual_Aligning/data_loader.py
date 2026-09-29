@@ -1,0 +1,297 @@
+"""
+Data loader for Visual Aligning DA.
+
+Single-seed, no halfspace/constraint folders.
+Supports two sources:
+  --source npz  (default) — loads {seed}/results/{variant}/{variant}.npz
+  --source json           — reconstructs per-rollout arrays from
+                            {seed}/results/{variant}/diagnostics/rollout_*_stats.json
+"""
+import os
+import glob
+import json
+import logging
+import numpy as np
+from collections import defaultdict
+from config import METRICS, ACTIVE_SEED
+
+logger = logging.getLogger(__name__)
+
+
+class DataLoader:
+    """Load per-rollout evaluation data for a single seed."""
+
+    def __init__(self, verbose: bool = False, source: str = 'npz'):
+        self.verbose    = verbose
+        self.source     = source   # 'npz' or 'json'
+        self.data       = {}       # {variant: metrics_dict}
+        self.files_found  = 0
+        self.files_loaded = 0
+        self.files_failed = 0
+        self.loading_log  = []
+
+    # ------------------------------------------------------------------
+    def load_results(self, root_path, seed=None, variants=None, geo_variant=None):
+        """
+        Load result files for one seed.
+
+        Args:
+            root_path:   path to model_exp_name folder (contains seed subfolders)
+            seed:        seed number (default: ACTIVE_SEED)
+            variants:    list of variant names (default: all discovered)
+            geo_variant: geometric constraint subfolder name (e.g. 'combined_5').
+                         When provided the loader steps into
+                         {seed}/results/{geo_variant}/ before discovering variants.
+                         This matches the eval script output schema:
+                           results/{geo_name}/{variant}/diagnostics/rollout_*_stats.json
+                         When None (default) the old flat schema is used:
+                           results/{variant}/diagnostics/rollout_*_stats.json
+
+        Returns:
+            {variant: metrics_dict} where array values have shape (N_rollouts,)
+        """
+        if seed is None:
+            seed = ACTIVE_SEED
+
+        if not os.path.exists(root_path):
+            logger.error(f'Root path does not exist: {root_path}')
+            return {}
+
+        seed_results_path = os.path.join(root_path, str(seed), 'results')
+        if not os.path.exists(seed_results_path):
+            logger.warning(f'Results dir not found: {seed_results_path}')
+            return {}
+
+        # AUTO-RETRIEVAL: Recursively find all variants, regardless of geo_constraint depth
+        if variants is None:
+            import glob
+            variants_set = set()
+            if self.source == 'json':
+                # Find all 'diagnostics' folders
+                search_pattern = os.path.join(seed_results_path, '**', 'diagnostics')
+                for path in glob.glob(search_pattern, recursive=True):
+                    if os.path.isdir(path):
+                        # The variant name is the relative path from seed_results_path
+                        # e.g., 'combined_5/dpcc-c' or just 'dpcc-c'
+                        rel_path = os.path.relpath(os.path.dirname(path), seed_results_path)
+                        variants_set.add(rel_path)
+            else:
+                # Find all '.npz' files
+                search_pattern = os.path.join(seed_results_path, '**', '*.npz')
+                for path in glob.glob(search_pattern, recursive=True):
+                    # Exclude the file name itself to get the variant folder
+                    rel_path = os.path.relpath(os.path.dirname(path), seed_results_path)
+                    variants_set.add(rel_path)
+            
+            variants = sorted(list(variants_set))
+            if not variants:
+                logger.warning(f'No {self.source} data found recursively in {seed_results_path}')
+                return {}
+        else:
+            # If explicitly passed but geo_variant is used (legacy compat)
+            if geo_variant is not None:
+                variants = [os.path.join(geo_variant, v) for v in variants]
+
+        logger.info(f'Loading seed={seed}, source={self.source}, variants={len(variants)}')
+
+        self.data = {}
+
+        for variant in variants:
+            try:
+                if self.source == 'npz':
+                    metrics = self._load_npz(seed_results_path, variant)
+                else:
+                    metrics = self._load_json(seed_results_path, variant)
+
+                if metrics is not None:
+                    self.data[variant] = metrics
+                    self.files_loaded += 1
+                else:
+                    self.files_failed += 1
+            except Exception as e:
+                msg = f'variant={variant}: FAILED — {e}'
+                logger.error(msg)
+                self.loading_log.append(('ERROR', msg))
+                self.files_failed += 1
+
+        logger.info(f'Loaded {self.files_loaded}, failed {self.files_failed}')
+        return dict(self.data)
+
+    # ------------------------------------------------------------------
+    def _load_npz(self, seed_results_path, variant):
+        """Load per-rollout arrays from {variant}/{basename(variant)}.npz."""
+        variant_basename = os.path.basename(variant)
+        npz_path = os.path.join(seed_results_path, variant, f'{variant_basename}.npz')
+        self.files_found += 1
+
+        if not os.path.exists(npz_path):
+            msg = f'{variant}: NPZ not found at {npz_path}'
+            logger.warning(msg)
+            self.loading_log.append(('MISSING', msg))
+            return None
+
+        data = np.load(npz_path, allow_pickle=True)
+        metrics = {k: data[k] for k in data.files}
+        logger.debug(f'Loaded NPZ: {variant} — keys: {list(metrics.keys())}')
+        return metrics
+
+    # ------------------------------------------------------------------
+    def _load_json(self, seed_results_path, variant):
+        """
+        Reconstruct per-rollout arrays from diagnostics/rollout_N_stats.json files.
+
+        JSON field mapping:
+          success                    → n_success
+          steps                      → n_steps
+          avg_inference_time_per_replan → avg_time
+          mean_distance              → mean_dist_per_rollout
+          max_physical_tracking_error → max_phys_error_per_rollout
+          context_info.init_xy_dist  → context_init_xy_dist
+          context_info.box_init_xy   → context_box_init_xy
+          context_info.target_xy     → context_target_xy
+          context_info.box_init_angle_deg   → context_box_angle_deg
+          context_info.target_angle_deg     → context_target_angle_deg
+          --- U_2: extended context_info ---
+          context_info.final_xy_dist       → context_final_xy_dist
+          context_info.final_box_angle_deg → context_final_box_angle_deg
+          context_info.final_box_xy        → context_final_box_xy
+          --- U_2: constraint_metrics block ---
+          constraint_metrics.*             → exec_* / plan_*
+        """
+        diag_path = os.path.join(seed_results_path, variant, 'diagnostics')
+        self.files_found += 1
+
+        if not os.path.exists(diag_path):
+            msg = f'{variant}: diagnostics folder not found at {diag_path}'
+            logger.warning(msg)
+            self.loading_log.append(('MISSING', msg))
+            return None
+
+        pattern = os.path.join(diag_path, 'rollout_*_stats.json')
+        json_files = sorted(glob.glob(pattern))
+
+        if not json_files:
+            msg = f'{variant}: no rollout JSON files in {diag_path}'
+            logger.warning(msg)
+            self.loading_log.append(('MISSING', msg))
+            return None
+
+        # Sort by rollout index
+        def _rollout_idx(path):
+            base = os.path.basename(path)  # rollout_7_stats.json
+            try:
+                return int(base.split('_')[1])
+            except Exception:
+                return 0
+
+        json_files = sorted(json_files, key=_rollout_idx)
+
+        rows = []
+        for jf in json_files:
+            try:
+                with open(jf, 'r') as f:
+                    r = json.load(f)
+                rows.append(r)
+            except Exception as e:
+                logger.warning(f'Failed to load {jf}: {e}')
+
+        if not rows:
+            return None
+
+        def _arr(key, default=0.0):
+            return np.array([r.get(key, default) for r in rows], dtype=np.float32)
+
+        def _ctx(field, default=0.0):
+            return np.array(
+                [r.get('context_info', {}).get(field, default) for r in rows],
+                dtype=np.float32
+            )
+
+        def _cmet(field, default=0.0):
+            """Extract from constraint_metrics sub-dict."""
+            return np.array(
+                [r.get('constraint_metrics', {}).get(field, default) for r in rows],
+                dtype=np.float32
+            )
+
+        n_success = _arr('success', 0)
+        metrics = {
+            'n_success':                 n_success,
+            'success_rate':              float(np.mean(n_success)),
+            'n_steps':                   _arr('steps', 0),
+            'avg_time':                  _arr('avg_inference_time_per_replan', 0.0),
+            'mean_dist_per_rollout':     _arr('mean_distance', 0.0),
+            'max_phys_error_per_rollout': _arr('max_physical_tracking_error', 0.0),
+            'context_init_xy_dist':      _ctx('init_xy_dist', 0.0),
+            'context_box_angle_deg':     _ctx('box_init_angle_deg', 0.0),
+            'context_target_angle_deg':  _ctx('target_angle_deg', 0.0),
+            # --- U_2: extended context_info ---
+            'context_final_xy_dist':         _ctx('final_xy_dist', 0.0),
+            'context_final_box_angle_deg':   _ctx('final_box_angle_deg', 0.0),
+            # --- U_2: constraint_metrics ---
+            'exec_n_violated_steps':                _cmet('exec_n_violated_steps', 0),
+            'exec_constraint_sat_rate':             _cmet('exec_constraint_sat_rate', 0.0),
+            'exec_zero_violation_rollout':           _cmet('exec_zero_violation_rollout', 0),
+            'exec_bounds_viol_count':               _cmet('exec_bounds_viol_count', 0),
+            'exec_halfspace_viol_count':             _cmet('exec_halfspace_viol_count', 0),
+            'exec_obstacle_viol_count':              _cmet('exec_obstacle_viol_count', 0),
+            'exec_max_bounds_viol_m':               _cmet('exec_max_bounds_viol_m', 0.0),
+            'exec_max_halfspace_viol_m':             _cmet('exec_max_halfspace_viol_m', 0.0),
+            'exec_max_obstacle_penetration_m':       _cmet('exec_max_obstacle_penetration_m', 0.0),
+            'exec_constraint_margin_mean_m':         _cmet('exec_constraint_margin_mean_m', 0.0),
+            'exec_first_violation_step':             _cmet('exec_first_violation_step', 0),
+            'exec_longest_safe_streak':              _cmet('exec_longest_safe_streak', 0),
+            'exec_dynamics_consistency_error_mean':  _cmet('exec_dynamics_consistency_error_mean', 0.0),
+            'exec_dynamics_consistency_error_max':   _cmet('exec_dynamics_consistency_error_max', 0.0),
+            'plan_post_viol_rate_mean':              _cmet('plan_post_viol_rate_mean', 0.0),
+            'plan_post_viol_rate_max':               _cmet('plan_post_viol_rate_max', 0.0),
+            'plan_n_replan_steps':                   _cmet('plan_n_replan_steps', 0),
+            # 2-D arrays
+            'context_box_init_xy': np.array(
+                [r.get('context_info', {}).get('box_init_xy', [0.0, 0.0]) for r in rows],
+                dtype=np.float32
+            ),
+            'context_target_xy': np.array(
+                [r.get('context_info', {}).get('target_xy', [0.0, 0.0]) for r in rows],
+                dtype=np.float32
+            ),
+            'context_final_box_xy': np.array(
+                [r.get('context_info', {}).get('final_box_xy', [0.0, 0.0]) for r in rows],
+                dtype=np.float32
+            ),
+        }
+        logger.debug(f'Loaded JSON: {variant} — {len(rows)} rollouts')
+        return metrics
+
+    # ------------------------------------------------------------------
+    def get_loading_summary(self):
+        return {
+            'files_found':  self.files_found,
+            'files_loaded': self.files_loaded,
+            'files_failed': self.files_failed,
+            'success_rate': self.files_loaded / max(self.files_found, 1),
+            'loading_log':  self.loading_log,
+        }
+
+    def save_loading_log(self, output_path):
+        with open(output_path, 'w') as f:
+            f.write('=== Data Loading Log ===\n\n')
+            f.write(f'Source:        {self.source}\n')
+            f.write(f'Files Found:   {self.files_found}\n')
+            f.write(f'Files Loaded:  {self.files_loaded}\n')
+            f.write(f'Files Failed:  {self.files_failed}\n')
+            f.write(f'Success Rate:  {100 * self.files_loaded / max(self.files_found, 1):.1f}%\n\n')
+            f.write('=== Detailed Log ===\n')
+            for level, msg in self.loading_log:
+                f.write(f'[{level:7s}] {msg}\n')
+        logger.info(f'Loading log saved to: {output_path}')
+
+    # ------------------------------------------------------------------
+    # MULTI-SEED-DEACTIVATED: original multi-seed loop kept below for reference.
+    # To re-activate: remove comment markers, restore seeds parameter in load_results().
+    #
+    # def load_results_multi_seed(self, root_path, seeds, variants, ...):
+    #     self.data = defaultdict(dict)   # {seed: {variant: metrics}}
+    #     for seed in seeds:
+    #         seed_path = os.path.join(root_path, str(seed), 'results')
+    #         ...

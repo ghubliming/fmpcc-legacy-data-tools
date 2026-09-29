@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# TEST STAND-IN for zstd (dry runs only; used when no real zstd is installed): gzip -n inside, same flags
+# as the log-archive scripts use: -c -d -dc -t -q -T# -#, stdin or one file, --version.
+dec=0; tst=0; files=()
+for a in "$@"; do
+    case "$a" in
+        --version) echo "zstd stand-in (gzip -n) for logarch dry runs"; exit 0 ;;
+        -dc|-cd|-d) dec=1 ;;
+        -t) dec=1; tst=1 ;;
+        -*) ;;
+        *) files+=("$a") ;;
+    esac
+done
+if [ "$tst" = 1 ]; then exec gzip -t "${files[@]}"; fi
+if [ "$dec" = 1 ]; then exec gzip -dc "${files[@]}"; fi
+exec gzip -n -1 -c "${files[@]}"

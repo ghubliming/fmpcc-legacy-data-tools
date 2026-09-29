@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# TEST STAND-IN for rclone (dry runs only): "<remote>:<path>" → $FAKE_DRIVE/<remote>/<path> on local disk.
+# Implements only what the log-archive scripts use: version listremotes about copyto copy rcat md5sum lsl lsf
+# deletefile purge check moveto sync, with --include/--exclude (rclone glob, leading '/' = anchored) and --files-from-raw.
+: "${FAKE_DRIVE:?FAKE_DRIVE must point at the fake Drive folder}"
+REMOTES="${FAKE_REMOTES:-gdrive}"
+map() { case "$1" in *:*) printf '%s/%s/%s' "$FAKE_DRIVE" "${1%%:*}" "${1#*:}" ;; *) printf '%s' "$1" ;; esac; }
+cmd="$1"; shift; pos=(); inc=(); exc=(); ff=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --include) inc+=("$2"); shift 2 ;;
+        --exclude) exc+=("$2"); shift 2 ;;
+        --files-from-raw|--files-from) ff="$2"; shift 2 ;;
+        --drive-chunk-size|--retries|--low-level-retries|--stats|--stats-log-level|--transfers|--checkers|--contimeout|--timeout|--max-depth|--log-level|--bwlimit) shift 2 ;;
+        -*) shift ;;
+        *) pos+=("$1"); shift ;;
+    esac
+done
+m1() { local f="$1" p="$2"; p="${p//\*\*/*}"; if [ "${p:0:1}" = / ]; then [[ "$f" == ${p:1} ]]; else [[ "$f" == $p || "$f" == */$p ]]; fi; }
+ok() { local f="$1" p
+       if [ ${#inc[@]} -gt 0 ]; then for p in "${inc[@]}"; do m1 "$f" "$p" && return 0; done; return 1; fi
+       for p in "${exc[@]}"; do m1 "$f" "$p" && return 1; done; return 0; }
+files() { if [ -n "$ff" ]; then cat "$ff"; else (cd "$1" && find . \( -type f -o -type l \) | sed 's#^\./##' | LC_ALL=C sort); fi; }
+case "$cmd" in
+    version)     echo "rclone v1.74.3 (logarch test stand-in)" ;;
+    listremotes) for r in $REMOTES; do echo "$r:"; done ;;
+    about)       printf '{\n\t"total": %s,\n\t"used": 1000,\n\t"free": %s\n}\n' $((2 * 1024**4)) $((2 * 1024**4 - 1000)) ;;
+    copyto)      s="$(map "${pos[0]}")"; d="$(map "${pos[1]}")"; [ -f "$s" ] || { echo "ERROR: not found: ${pos[0]}" >&2; exit 3; }
+                 mkdir -p "$(dirname "$d")"; cp "$s" "$d" ;;
+    rcat)        d="$(map "${pos[0]}")"; mkdir -p "$(dirname "$d")"; cat > "$d.tmp" && mv "$d.tmp" "$d" ;;
+    md5sum)      p="$(map "${pos[0]}")"; [ -f "$p" ] && printf '%s  %s\n' "$(md5sum < "$p" | cut -d' ' -f1)" "${p##*/}" ;;
+    lsl)         p="$(map "${pos[0]}")"; [ -f "$p" ] && printf '%9d 2026-01-01 00:00:00.000000000 %s\n' "$(stat -c %s "$p")" "${p##*/}" ;;
+    lsf)         p="$(map "${pos[0]}")"; if [ -f "$p" ]; then basename "$p"; elif [ -d "$p" ]; then ls -1 "$p"; else exit 3; fi ;;
+    deletefile)  p="$(map "${pos[0]}")"; rm -f "${p:?}" ;;
+    moveto)      s="$(map "${pos[0]}")"; d="$(map "${pos[1]}")"; [ -e "$s" ] || { echo "ERROR: not found: ${pos[0]}" >&2; exit 3; }
+                 mkdir -p "$(dirname "$d")"; mv "$s" "$d" ;;
+    sync)        s="$(map "${pos[0]}")"; d="$(map "${pos[1]}")"; [ -d "$s" ] || exit 3; mkdir -p "$d"
+                 while IFS= read -r f; do mkdir -p "$(dirname "$d/$f")"; cp -P "$s/$f" "$d/$f"; done < <(files "$s")
+                 while IFS= read -r f; do [ -e "$s/$f" ] || rm -f "${d:?}/${f:?}"; done < <(files "$d") ;;
+    purge)       p="$(map "${pos[0]}")"; rm -rf "${p:?}" ;;
+    copy)        s="$(map "${pos[0]}")"; d="$(map "${pos[1]}")"; [ -d "$s" ] || { echo "ERROR: directory not found: ${pos[0]}" >&2; exit 3; }
+                 mkdir -p "$d"
+                 while IFS= read -r f; do ok "$f" || continue; [ -e "$s/$f" ] || { echo "ERROR: $f missing" >&2; exit 3; }
+                     mkdir -p "$(dirname "$d/$f")"; cp -P "$s/$f" "$d/$f"; done < <(files "$s") ;;
+    check)       s="$(map "${pos[0]}")"; d="$(map "${pos[1]}")"; bad=0
+                 while IFS= read -r f; do ok "$f" || continue
+                     if [ ! -e "$d/$f" ] || [ "$(md5sum < "$s/$f")" != "$(md5sum < "$d/$f")" ]; then echo "ERROR : $f: differ/missing" >&2; bad=$((bad + 1)); fi
+                 done < <(files "$s")
+                 echo "NOTICE: $bad differences found" >&2; [ "$bad" -eq 0 ] ;;
+    *)           echo "rclone stand-in: unsupported command '$cmd'" >&2; exit 9 ;;
+esac

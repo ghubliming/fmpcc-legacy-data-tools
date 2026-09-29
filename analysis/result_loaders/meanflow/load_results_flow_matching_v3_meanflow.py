@@ -1,0 +1,221 @@
+import argparse
+import importlib
+import sys
+import yaml
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import flow_matcher_v3_meanflow.utils as utils
+
+# 🔵 U9 MATCHED-K AUTO-EVAL — ⚠️ MATCHED BUDGET OR NOTHING (PLAN §7). Mirrors the eval script's
+# --flow-steps so the aggregation reads the SAME K that was evaluated; results live in a per-K
+# directory (flow_steps_v3 is watched as 'K'), so without this the HFFM_FLOW_STEPS default (2)
+# would be reported no matter which budget was actually run.
+_ap = argparse.ArgumentParser(description='Aggregate MeanFlow (Gen3v6) eval results.')
+_ap.add_argument('--flow-steps', type=int, default=None, metavar='K',
+                 help='override flow_steps_v3 (NFE budget K) when locating results')
+_cli, _remaining = _ap.parse_known_args()
+sys.argv = [sys.argv[0]] + _remaining
+
+# Load configuration
+# Gen3v6 U3: repointed to the Gen3v6-dedicated unified eval config (DPCC + HardFlow arms).
+_cfg_path = 'config/meanflow_projection_eval.yaml'
+with open(_cfg_path, 'r') as file:
+    config = yaml.safe_load(file)
+
+# 🔴 FIX_9_CFG_PROVENANCE — publish the yaml THIS script loaded, exactly as the eval does. The
+# 'T' token in the results-folder name is built from it by config/avoiding-d3il.py; without this
+# line the aggregation would look for a path derived from the SHARED config/projection_eval.yaml,
+# a file Gen3v6 never opens. Must be set BEFORE the first Parser().parse_args().
+os.environ['FMPCC_PROJ_CFG'] = _cfg_path
+
+projection_variants = config['projection_variants']
+
+exp = 'avoiding-d3il'
+
+if _cli.flow_steps is not None:
+    # 🔵 U9 — same data path as the eval script: patch the cached config module's plan block so
+    # exp_name/savepath pick up '_K{K}_'. Arm C's `flow_steps` is patched with the SAME value
+    # (matched budget) so a HardFlow aggregation reads the directory arm C actually wrote.
+    _blk = importlib.import_module('config.' + exp).base['plan_fm_v3_meanflow']
+    _blk['flow_steps_v3'] = _cli.flow_steps
+    if 'ode_inference_steps_v3' in _blk:
+        _blk['ode_inference_steps_v3'] = _cli.flow_steps
+    _blk['flow_steps'] = _cli.flow_steps
+    print(f'[ load_results ] Overriding flow_steps_v3 / flow_steps (K) to: {_cli.flow_steps}')
+
+class Parser(utils.Parser):
+    dataset: str = exp
+    config: str = 'config.' + exp
+
+seeds = config['seeds']
+avoiding_halfspace_variants = config['avoiding_halfspace_variants']
+
+sr_goal_all = {}
+sr_constraints_all = {}
+timesteps_avg_all = {}
+timesteps_std_all = {}
+
+# We will set the plot_path dynamically inside the loop
+plot_path = None
+
+for variant in projection_variants:
+    n_success_all = np.array([])
+    n_success_and_constraints_all = np.array([])
+    n_steps_all = np.array([])
+    n_violations_all = np.array([])
+    total_violations_all = np.array([])
+    collision_free_completed_all = np.array([])
+    # Gen3v6 U3 — HardFlow-arm metric accumulators (stay 0 for arms A/B).
+    nfe_sum = 0
+    nlp_solves_sum = 0
+    nlp_failures_sum = 0
+    is_hardflow_variant = False
+    for halfspace_variant in avoiding_halfspace_variants:
+        for i, seed in enumerate(seeds):
+            args = Parser().parse_args(experiment='plan_fm_v3_meanflow', seed=seed)
+            if plot_path is None:
+                # The savepath is usually logbase/dataset/exp_name/seed
+                # We want the plots to be in logbase/dataset/exp_name/plots/load_results_output_all_seeds
+                load_path = os.path.dirname(args.savepath)
+                plot_path = os.path.join(load_path, 'plots', 'load_results_output_all_seeds')
+                os.makedirs(plot_path, exist_ok=True)
+                print(f'[ utils ] Set plot_path to: {plot_path}')
+
+            flow_steps = getattr(args, 'flow_steps_v3', getattr(args, 'ode_inference_steps_v3', 'n/a'))
+            ode_steps = getattr(args, 'ode_inference_steps_v3', flow_steps)
+            beta_alpha = getattr(args, 'time_beta_alpha_v3', 'n/a')
+            beta_beta = getattr(args, 'time_beta_beta_v3', 'n/a')
+            print(f'Eval ODE={ode_steps}, FlowSteps={flow_steps}, Beta=({beta_alpha},{beta_beta})')
+
+            # Get data
+            try:
+                data = np.load(f'{args.savepath}/results/halfspace_{halfspace_variant}/{variant}.npz', allow_pickle=True)
+                n_success = data["n_success"]
+                n_success_and_constraints = data["n_success_and_constraints"]
+                n_steps = data["n_steps"]
+                n_violations = data["n_violations"]
+                total_violations = data["total_violations"]
+                avg_time = data["avg_time"]
+                collision_free_completed = data["collision_free_completed"]
+
+                n_success_all = np.append(n_success_all, n_success)
+                n_success_and_constraints_all = np.append(n_success_and_constraints_all, n_success_and_constraints)
+                n_steps_all = np.append(n_steps_all, n_steps[n_success > 0])
+                n_violations_all = np.append(n_violations_all, n_violations)
+                total_violations_all = np.append(total_violations_all, total_violations)
+                collision_free_completed_all = np.append(collision_free_completed_all, collision_free_completed)
+                # Gen3v6 U3 — pull HardFlow-arm metrics if present (older npz without them → skip).
+                if 'is_hardflow' in data and bool(data['is_hardflow']):
+                    is_hardflow_variant = True
+                    nfe_sum += int(data['nfe_total'])
+                    nlp_solves_sum += int(data['nlp_solves_total'])
+                    nlp_failures_sum += int(data['nlp_failures_total'])
+            except FileNotFoundError:
+                print(f"[ Error ] Could not find results at: {args.savepath}/results/halfspace_{halfspace_variant}/{variant}.npz")
+                continue
+
+    if len(n_success_all) == 0:
+        print(f"Skipping variant {variant} due to no data found.")
+        continue
+
+    success_rate_goal = n_success_all.mean()
+    success_rate_goal_constraints = n_success_and_constraints_all.mean()
+    success_rate_constraints = collision_free_completed_all.mean()
+    steps_avg = n_steps_all.mean() if len(n_steps_all) > 0 else 0
+    steps_std = n_steps_all.std() if len(n_steps_all) > 0 else 0
+    n_violations_avg = n_violations_all.mean()
+    n_violations_std = n_violations_all.std()
+    total_violations_avg = total_violations_all.mean()
+    total_violations_std = total_violations_all.std()
+
+    print(f'------------------ Variant: {variant} ------------------')
+    print(f'Success rate (goal): {success_rate_goal:.2f}')
+    print(f'Success rate (goal + constraints): {success_rate_goal_constraints:.2f}')
+    print(f'Success rate (constraints): {success_rate_constraints:.2f}')
+    print(f'Average steps: {steps_avg:.2f} +- {steps_std:.2f}')
+    print(f'Average violations: {n_violations_avg:.2f} +- {n_violations_std:.2f}')
+    print(f'Average total violations: {total_violations_avg:.3f} +- {total_violations_std:.3f}')
+    print(f'Average time: {avg_time.mean():.2f} +- {avg_time.std():.2f}')
+    # Gen3v6 U3 — HardFlow-arm compute metrics (summed over halfspace×seed).
+    if is_hardflow_variant:
+        print(f'[hardflow] NFE(sum)={nfe_sum}  NLP solves(sum)={nlp_solves_sum}  '
+              f'NLP failures(sum)={nlp_failures_sum}')
+    print(f'${steps_avg:.1f} \pm {steps_std:.1f}$ & ${success_rate_goal:.2f}$ & ${success_rate_constraints:.2f}$ & ${n_violations_avg:.1f} \pm {n_violations_std:.1f}$ \\\\')
+
+    sr_goal_all[variant] = success_rate_goal
+    sr_constraints_all[variant] = success_rate_constraints
+    timesteps_avg_all[variant] = steps_avg
+    timesteps_std_all[variant] = steps_std
+
+# Plot results
+variants_to_plot = [['dpcc-r', 'dpcc-t', 'dpcc-c'], ['dpcc-r-tightened', 'dpcc-t-tightened', 'dpcc-c-tightened']]
+variants_labels = ['DPCC-R', 'DPCC-T', 'DPCC-C']
+
+for variants in variants_to_plot:
+    # Check if all variants in the group have data
+    if not all(variant in sr_goal_all for variant in variants):
+        print(f"Skipping plot for {variants} as some data is missing.")
+        continue
+
+    # Extract success rates for each variant
+    sr_goal = [sr_goal_all[variant] for variant in variants]
+    sr_constraints = [sr_constraints_all[variant] for variant in variants]
+    timesteps_avg = [timesteps_avg_all[variant] for variant in variants]
+    timesteps_std = [timesteps_std_all[variant] for variant in variants]
+    print(sr_goal)
+    print(sr_constraints)
+    print(timesteps_avg)
+    print(timesteps_std)
+
+    # Create a bar plot
+    x = np.arange(len(variants))  # the label locations
+    width = 0.35  # the width of the bars
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    bars1 = ax.bar(x - width/2, sr_goal, width, label='Goal reached', color='green')
+    bars2 = ax.bar(x + width/2, sr_constraints, width, label='Constraints satisfied', color='red')
+
+    # Add some text for labels, title and custom x-axis tick labels, etc.
+    ax.set_ylabel('Success Rate', fontsize=12)
+    ax.set_xticks(x)
+    ax.set_xticklabels(variants_labels, fontsize=12)
+    plt.setp(ax.get_yticklabels(), fontsize=12)
+    ax.legend(loc='lower left', fontsize=12) 
+
+    # Add labels to the bars
+    def add_labels(bars):
+        for bar in bars:
+            height = bar.get_height()
+            ax.annotate(f'{height:.2f}',
+                        xy=(bar.get_x() + bar.get_width() / 2, height),
+                        xytext=(0, 3),  # 3 points vertical offset
+                        textcoords="offset points",
+                        ha='center', va='bottom')
+    add_labels(bars1)
+    add_labels(bars2)
+
+    fig.tight_layout()
+
+    save_name = 'success_rates_tightened_fm.png' if 'tightened' in variants[0] else 'success_rates_fm.png'
+    plt.savefig(os.path.join(plot_path, save_name))
+    plt.show()
+
+    # Create the second bar plot for timesteps
+    fig, ax = plt.subplots(figsize=(10, 10))
+    bars = ax.bar(x, timesteps_avg, width, yerr=timesteps_std, label='Timesteps', color=[0.5, 0.5, 1], capsize=5)
+
+    # Add some text for labels, title and custom x-axis tick labels, etc.
+    ax.set_xticks(x)
+    ax.set_xticklabels(variants_labels, fontsize=12)
+    plt.setp(ax.get_yticklabels(), fontsize=12)
+    ax.set_ylim([0, 100])
+    ax.legend(loc='lower left', fontsize=12) 
+
+    # Add labels to the bars
+    add_labels(bars)
+
+    fig.tight_layout()
+    save_name = 'timesteps_tightened_fm.png' if 'tightened' in variants[0] else 'timesteps_fm.png'
+    plt.savefig(os.path.join(plot_path, save_name))
+    plt.show()
