@@ -1,0 +1,7 @@
+__pycache__/
+logs/
+*.pt
+*.npz
+*.tar.zst
+wandb/
+node_modules/
