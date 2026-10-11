@@ -79,6 +79,10 @@ projection of the predicted end point only. Model class names in old folder name
 
 The last full batch run (2026-09-27, one batch per task) is already on Drive: `FMPCC_logs_backup/analysis_csv_20260927/` (its `README.md` says which file is which).
 
+Next to the archive, at the Drive root, each with its own `README.md`: `uav_demonstrations_v1_20260622/` = the quadrotor demonstration
+dataset the UAV models were trained on (`data/uav_fm/v1`, not inside `full_20260927`); `p7_bridge_raw_results_20260928/` = raw results of
+the check that the released code reproduces the development code on one job.
+
 The sbatch files call the pipelines by their original location (`Data_Analysis/<pipeline>/`) — adjust that path.
 
 ## Old data vs. the released code
